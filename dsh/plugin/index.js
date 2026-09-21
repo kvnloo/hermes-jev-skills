@@ -11,6 +11,7 @@
 // the public `agent/request` waterfall and rewrites the proposed config.
 import { appendFileSync, mkdirSync, readFileSync } from 'node:fs'
 import { execFile, spawn } from 'node:child_process'
+import { lineageOf, operationId, roleFor, traceIdFor } from './lineage.js'
 import { dirname } from 'node:path'
 
 export const name = 'hermes-jev-dsh'
@@ -216,6 +217,62 @@ function sampleHash(key) {
   return h / 4294967296
 }
 
+/**
+ * Canonical lineage for one request. Reads DSH session metadata only; nothing is
+ * inferred from session-id or agent-id shape. Parentage resolution uses
+ * parentSession, supplied by a small resolver the caller passes in (the adapter
+ * cannot walk the session registry from inside this hook).
+ *
+ * No prompt text is recorded here: this receipt exists for LINEAGE, not usage.
+ */
+function attribution(agent, turn, step, attempt, parentOf) {
+  const header = agent?.session?.header ?? agent?.session?.sessionHeader ?? null
+  const lin = lineageOf(header)
+  // The agent id is the session id for a root (`session-<id>`); record both
+  // without treating the naming as proof of parentage.
+  const sessionId = lin.session_id ?? null
+  const parentSessionId = lin.parent_session_id
+
+  // A session with no parentSession IS a root: that is provable from the header
+  // alone and needs no registry. A session WITH a parentSession cannot be
+  // resolved from inside this hook, and resolving it by assuming "no parent"
+  // would mint a WRONG trace for every child -- worse than an unknown. So an
+  // unresolvable chain reports null and says why.
+  let rootSessionId = null
+  let traceId = null
+  let depth = null
+  let rootResolution
+  if (sessionId === null) {
+    rootResolution = 'no_session_metadata'
+  } else if (parentSessionId == null) {
+    const resolved = traceIdFor(sessionId, () => null)
+    rootSessionId = resolved.root_session_id
+    traceId = resolved.trace_id
+    depth = 0
+    rootResolution = 'self_root'
+  } else {
+    rootResolution = 'unresolved_in_hook'
+  }
+
+  return {
+    session_id: sessionId,
+    parent_session_id: parentSessionId,
+    root_session_id: rootSessionId,
+    trace_id: traceId,
+    root_resolution: rootResolution,
+    agent_id: agent?.id ?? null,
+    origin: lin.origin,
+    delegation_depth: lin.delegation_depth,
+    // Depth is unknown when the chain is unresolved; having a parentSession is
+    // itself proof this is not the root.
+    role: depth === 0 ? 'root' : roleFor({ depth: depth ?? 1, origin: lin.origin }),
+    turn: turn ?? null,
+    step: step ?? null,
+    attempt: attempt ?? 0,
+    operation_id: sessionId ? operationId(sessionId, turn, step, attempt ?? 0) : null,
+  }
+}
+
 function emit(rec) {
   try {
     mkdirSync(dirname(RECEIPTS), { recursive: true })
@@ -392,6 +449,8 @@ export function apply(ctx) {
         model: proposed?.model,
         reasoningEffort: proposed?.reasoningEffort,
         routed: false,
+        // Lineage only -- this receipt never carries usage.
+        ...attribution(agent, turn, step, 0),
       })
       return proposed
     }
@@ -553,6 +612,7 @@ export function apply(ctx) {
       turn,
       step,
       purpose: 'root',
+      ...attribution(agent, turn, step, 0),
       provider: result.provider,
       model: result.model,
       reasoningEffort: result.reasoningEffort,
