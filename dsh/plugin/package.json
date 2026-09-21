@@ -1,0 +1,14 @@
+{
+  "name": "hermes-jev-dsh",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Thin DeepSeek Harness adapter for the canonical hermes-jev-skills routing policy.",
+  "main": "index.js",
+  "exports": { ".": "./index.js" },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}
