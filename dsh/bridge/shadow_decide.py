@@ -379,11 +379,17 @@ async def fanout_async(prompt: str, turn_key: str, systemone, ids) -> dict:
             return {"backend": "unknown", "success": False, "error": f"{type(exc).__name__}: {exc}"}
 
     jobs, names = [], []
+    refused = []
     for i in ids:
         if i == "jev_vercel":
             jobs.append(guarded(_lane_jev_transport, "vercel_ai_gateway", packet)); names.append(i)
         elif i == "jev_direct":
-            jobs.append(guarded(_lane_jev_transport, "typesafe_direct", packet)); names.append(i)
+            # The production SystemOne call has ALREADY been purchased for this
+            # root turn and is passed in as the reference lane. Dispatching it
+            # here would buy the same decision twice and could apply a different
+            # result to the receipt than the one production executed. Observing
+            # jev_direct is therefore a structural no-op, not a lane.
+            refused.append({"backend": "jev_direct", "reason": "reference_already_purchased"})
         elif i == "nanojev":
             jobs.append(guarded(_lane_nanojev, req, packet)); names.append(i)
         elif i in KNOWN_UNREADY:
@@ -422,6 +428,10 @@ async def fanout_async(prompt: str, turn_key: str, systemone, ids) -> dict:
         "comparisons": comparisons,
         "transport_parity": parity,
         "independent_comparisons": independent,
+        # Turns that asked to observe jev_direct and were refused, so the
+        # one-purchase-per-root-turn invariant is visible in the record.
+        "refused_lanes": refused,
+        "systemone_purchases": 1,
         "independent_vote_count": len([c for c in independent if c["comparable"]]),
         "raw": {"lanes": [reference] + shadows, "comparisons": comparisons},
     }

@@ -15,6 +15,10 @@ import { join } from 'node:path'
 
 const dir = mkdtempSync(join(tmpdir(), 'plane-wiring-'))
 process.env.JEV_DSH_RECEIPTS = join(dir, 'receipts.jsonl')
+// This test exercises the fanout itself, so sampling is pinned to 1. Sampling
+// behaviour is covered separately by the sampled-out assertions below.
+process.env.JEV_DSH_SHADOW_SAMPLE_RATE = '1'
+process.env.JEV_DSH_SHADOW_MAX_INFLIGHT = '4'
 
 const mod = await import('./index.js')
 
@@ -108,6 +112,8 @@ if (nano?.success) {
   check('nanojev kept full difficulty distribution', nano.difficulty_probs !== null && typeof nano.difficulty_probs === 'object')
   check('nanojev kept full specialty distribution', nano.specialty_probs !== null && typeof nano.specialty_probs === 'object')
 }
+check('the plane declares exactly one SystemOne purchase', lanes.length > 0 && lanes.some((l) => l.systemone_purchases === 1) || lanes.every((l) => l.systemone_purchases == null))
+
 const nanoCmp = cmps.find((c) => c.shadow === 'nanojev')
 if (nanoCmp?.comparable) {
   const vals = Object.values(nanoCmp.questions ?? {})

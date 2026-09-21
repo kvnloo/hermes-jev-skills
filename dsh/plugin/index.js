@@ -50,6 +50,17 @@ function effortForTier(tier) {
 // mushroom/fly. Shadows can never change provider/model/effort/RLM/tools. A
 // shadow failure is recorded and ignored. No voting, no first-response-wins.
 const DECISION_BACKENDS = (process.env.JEV_DSH_SHADOW_BACKENDS || 'nanojev').split(',').filter(Boolean)
+// Sampling and a hard in-flight cap keep observers from making the user wait or
+// contending with foreground inference. Full fanout belongs in explicit
+// comparison mode, not ordinary dogfood.
+const SHADOW_SAMPLE_RATE = clamp01(Number(process.env.JEV_DSH_SHADOW_SAMPLE_RATE ?? 0.1))
+const SHADOW_MAX_INFLIGHT = Math.max(0, Number(process.env.JEV_DSH_SHADOW_MAX_INFLIGHT ?? 1))
+let shadowInFlight = 0
+
+function clamp01(n) {
+  if (!Number.isFinite(n)) return 0.1
+  return n < 0 ? 0 : n > 1 ? 1 : n
+}
 const LANE_PY = process.env.JEV_DSH_SHADOW_PYTHON || '/home/kvn/tmp/openjev/.venv/bin/python'
 const LANE_BRIDGE = process.env.JEV_DSH_SHADOW_BRIDGE || `${JEV_ROOT}/dsh/bridge/shadow_decide.py`
 const LANE_TIMEOUT_MS = Number(process.env.JEV_DSH_SHADOW_TIMEOUT_MS || 60000)
@@ -83,6 +94,20 @@ function referenceLane(d) {
 function runDecisionPlane({ prompt, turn, agentId, decision }) {
   if (!DECISION_BACKENDS.length || !prompt) return
   const turnKey = `${agentId ?? 'agent'}:${turn}`
+  // Deterministic sampling per turn key, so a replay of the same turn makes the
+  // same decision and the record stays reproducible.
+  if (SHADOW_SAMPLE_RATE < 1 && sampleHash(turnKey) >= SHADOW_SAMPLE_RATE) {
+    emit({ type: 'decision_receipt', turn_key: turnKey, backend: null, skipped: true,
+           reason: 'sampled_out', sample_rate: SHADOW_SAMPLE_RATE, student_changed_execution: false })
+    return
+  }
+  if (shadowInFlight >= SHADOW_MAX_INFLIGHT) {
+    emit({ type: 'decision_receipt', turn_key: turnKey, backend: null, skipped: true,
+           reason: 'queue_saturated', in_flight: shadowInFlight, student_changed_execution: false })
+    return
+  }
+  shadowInFlight++
+  const queuedAt = Date.now()
   try {
     const child = spawn(
       LANE_PY,
@@ -106,6 +131,8 @@ function runDecisionPlane({ prompt, turn, agentId, decision }) {
     const killer = setTimeout(() => { try { child.kill('SIGKILL') } catch {} }, LANE_TIMEOUT_MS)
     child.on('close', () => {
       clearTimeout(killer)
+      shadowInFlight = Math.max(0, shadowInFlight - 1)
+      const queueDelayMs = Date.now() - queuedAt
       try {
         const parsed = JSON.parse(out)
         const common = {
@@ -116,6 +143,10 @@ function runDecisionPlane({ prompt, turn, agentId, decision }) {
           harness: 'dsh',
           policy_version: 'route-2',
           packet_chars: parsed.packet_chars ?? null,
+          queue_delay_ms: queueDelayMs,
+          sample_rate: SHADOW_SAMPLE_RATE,
+          systemone_purchases: parsed.systemone_purchases ?? null,
+          refused_lanes: parsed.refused_lanes ?? null,
           student_changed_execution: false,
         }
         for (const lane of parsed.lanes ?? []) {
@@ -170,8 +201,19 @@ function runDecisionPlane({ prompt, turn, agentId, decision }) {
       }
     })
   } catch (e) {
+    shadowInFlight = Math.max(0, shadowInFlight - 1)
     emit({ type: 'decision_receipt', turn_key: turnKey, error: String(e), student_changed_execution: false })
   }
+}
+
+/** Stable [0,1) hash of a turn key, for reproducible sampling. */
+function sampleHash(key) {
+  let h = 2166136261
+  for (let i = 0; i < key.length; i++) {
+    h ^= key.charCodeAt(i)
+    h = Math.imul(h, 16777619) >>> 0
+  }
+  return h / 4294967296
 }
 
 function emit(rec) {
