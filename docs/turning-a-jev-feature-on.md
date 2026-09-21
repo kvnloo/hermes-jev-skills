@@ -17,13 +17,42 @@ Three modes, default to the middle one:
 | `on` | yes | yes | yes |
 
 In `shadow` you pay the full cost and the full latency and get a complete log of what the
-feature *would* have done, while the system behaves exactly as it did yesterday. Then a
-person reads a batch and decides whether it earned the switch.
+feature *would* have done, while the system behaves exactly as it did yesterday. That log
+is **instrumentation, not validation**. A person should inspect it for obvious mistakes,
+then replay or join the decisions to an outcome that Jev did not create: verified task
+quality, downstream recall, a human correction/disposition, environment success, or
+measured cost/latency. Only a held-out outcome comparison can show that the feature earned
+the switch.
 
 The first routing policy that felt right escalated **89% of turns** to the expensive tier.
 Shadow mode is the only reason that cost nothing — it would have been roughly a 7×
 increase, $140 → $1,014 a week. Nobody reviews a policy they believe is already correct, so
 the review has to happen while the policy is still inert.
+
+
+
+### Shadow agreement is not ground truth
+
+If you are distilling Jev into NanoJev, another local model, a rule, or a smaller specialist,
+"agrees with Jev" is a useful teacher metric but not the release criterion. Measure the
+teacher too. Repeated reference calls can expose probability variance or threshold flips,
+and a disagreement may be a teacher error.
+
+Keep related observations from the same session/work item in the same evaluation fold.
+Otherwise repeated turns from one task leak task identity into both train and test.
+
+The safe sequence is:
+
+```text
+shadow readings
+  -> independent outcomes
+  -> grouped held-out replay
+  -> calibration / quality / latency / cost
+  -> human review
+  -> on
+```
+
+The fail-open rails in this repository stay authoritative regardless of the score.
 
 ## 2. Benchmark your benchmark before you believe it
 
