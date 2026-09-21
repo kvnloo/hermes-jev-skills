@@ -1,19 +1,19 @@
-// Integration proof for the shadow-backend wiring in index.js, without DSH.
+// Integration proof for the parallel decision plane wiring in index.js, without DSH.
 //
 //   node dsh/plugin/shadow_wiring.selftest.mjs
 //
-// Drives the REAL `agent/request` handler registered by apply() against a fake
-// cordis ctx and a real jev decision, then asserts the observer contract:
-//   1. a shadow_comparison receipt is produced for the same turn
-//   2. the returned request config is NOT affected by any student
-//   3. student_changed_execution is false and student values are recorded as
-//      full distributions, not collapsed to a verdict
+// Drives the REAL `agent/request` handler that apply() registers, against a fake
+// cordis ctx and a real jev decision, then asserts the plane contract:
+//   1. every lane shares one decision_id / trace_id / turn_key
+//   2. systemone_direct is the ONLY production lane; the rest are shadow
+//   3. the returned request config is untouched by any lane
+//   4. comparisons keep raw continuous values (deltas, threshold sides)
 // Receipts go to a temp file; the live receipt stream is untouched.
 import { mkdtempSync, readFileSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-const dir = mkdtempSync(join(tmpdir(), 'shadow-wiring-'))
+const dir = mkdtempSync(join(tmpdir(), 'plane-wiring-'))
 process.env.JEV_DSH_RECEIPTS = join(dir, 'receipts.jsonl')
 
 const mod = await import('./index.js')
@@ -25,84 +25,87 @@ const check = (name, cond, detail) => {
 }
 
 let handler = null
-const fakeCtx = {
+mod.apply({
   llm: { listProviders: () => [] },
   on: (event, fn) => {
     if (event === 'agent/request') handler = fn
   },
-}
-mod.apply(fakeCtx)
+})
 check('apply() registered the agent/request handler', typeof handler === 'function')
 
 const proposed = { provider: 'deepseek-official', model: 'deepseek-flash', reasoningEffort: 'low', maxTokens: 256000 }
 const agent = {
-  id: 'session-shadowtest-0000',
+  id: 'session-planetest-0000',
   parentId: null,
-  frozenMessages: [{ role: 'user', content: 'Explain how a B-tree node split works during insertion, and why the minimum degree matters.' }],
+  frozenMessages: [{ role: 'user', content: 'Design a zero-downtime migration of a 4 TB SQLite archive into a sharded store.' }],
 }
 
 const t0 = Date.now()
 const returned = await handler({ agent, turn: 1, step: 1 }, async () => ({ ...proposed }))
-const decisionMs = Date.now() - t0
-
 check('handler returned a config object', returned !== null && typeof returned === 'object')
-check('provider was not touched by observers', returned.provider === proposed.provider, `provider=${returned.provider}`)
-check('model was not touched by observers', returned.model === proposed.model, `model=${returned.model}`)
-check(
-  'effort came from the JEV tier, not from a student',
-  ['low', 'high'].includes(returned.reasoningEffort) && returned.maxTokens === proposed.maxTokens,
-  `effort=${returned.reasoningEffort} maxTokens=${returned.maxTokens} decisionMs=${decisionMs}`,
-)
+check('production routing untouched by shadows', returned.provider === proposed.provider && returned.model === proposed.model, `${returned.provider}/${returned.model}`)
+check('effort came from the JEV tier, not a lane', ['low', 'high'].includes(returned.reasoningEffort) && returned.maxTokens === proposed.maxTokens, `effort=${returned.reasoningEffort} in ${Date.now() - t0}ms`)
 
-// Wait for the detached shadow child to land its receipt.
-const deadline = Date.now() + 90_000
-let recs = []
-while (Date.now() < deadline) {
-  recs = existsSync(process.env.JEV_DSH_RECEIPTS)
+const read = () =>
+  existsSync(process.env.JEV_DSH_RECEIPTS)
     ? readFileSync(process.env.JEV_DSH_RECEIPTS, 'utf8')
         .split('\n')
         .filter(Boolean)
-        .map((l) => {
-          try {
-            return JSON.parse(l)
-          } catch {
-            return null
-          }
-        })
+        .map((l) => { try { return JSON.parse(l) } catch { return null } })
         .filter(Boolean)
     : []
-  if (recs.some((r) => r.type === 'shadow_comparison')) break
+
+const deadline = Date.now() + 120_000
+let recs = []
+while (Date.now() < deadline) {
+  recs = read()
+  const lanes = recs.filter((r) => r.type === 'decision_receipt')
+  if (lanes.some((l) => l.backend !== 'systemone_direct') && recs.some((r) => r.type === 'decision_comparison')) break
   await new Promise((r) => setTimeout(r, 500))
 }
 
-const types = recs.map((r) => r.type)
-console.log(`\nreceipts: ${JSON.stringify(types)}`)
-const shadow = recs.filter((r) => r.type === 'shadow_comparison')
-check('a shadow_comparison receipt was produced', shadow.length > 0)
-const jev = recs.find((r) => r.type === 'jev_decision')
-check('a jev_decision receipt was produced for the same turn', Boolean(jev))
+const lanes = recs.filter((r) => r.type === 'decision_receipt')
+const cmps = recs.filter((r) => r.type === 'decision_comparison')
+console.log(`\nreceipt types: ${JSON.stringify([...new Set(recs.map((r) => r.type))])}`)
+check('one production lane emitted', lanes.filter((l) => l.backend === 'systemone_direct').length === 1)
+check('exactly one lane claims production authority', lanes.filter((l) => l.authority === 'production').length === 1)
+check('shadow lanes are labelled shadow', lanes.filter((l) => l.backend !== 'systemone_direct').every((l) => l.authority === 'shadow'))
 
-if (shadow.length) {
-  for (const s of shadow) {
-    console.log(
-      `\nbackend=${s.backend} model=${s.model} success=${s.success} error=${s.error}\n` +
-        `  difficulty=${s.difficulty} probs=${JSON.stringify(s.difficulty_probs)} conf=${s.confidence}\n` +
-        `  specialty=${s.specialty} probs=${JSON.stringify(s.specialty_probs)} agreement=${s.specialty_agreement}\n` +
-        `  costly_mistake_prob=${s.costly_mistake_prob}\n` +
-        `  jev: tier=${s.jev_tier} difficulty=${s.jev_difficulty} specialty=${s.jev_specialty} conf=${s.jev_confidence}\n` +
-        `  confidence_delta=${s.confidence_delta} threshold_distance_student=${s.threshold_distance_student}\n` +
-        `  latency_ms=${s.latency_ms} backend_latency_ms=${s.backend_latency_ms}`,
-    )
-    check(`${s.backend}: declared observers-only`, s.student_changed_execution === false)
-    check(`${s.backend}: tied to the same decision as JEV`, s.turn_key === (jev ? `${jev.agentId}:${jev.turn}` : null), `turn_key=${s.turn_key}`)
-    check(`${s.backend}: decision_id equals turn_key for joinability`, s.decision_id === s.turn_key)
-    if (s.success) {
-      check(`${s.backend}: kept a full distribution, not a verdict`, s.difficulty_probs !== null && typeof s.difficulty_probs === 'object')
-      check(`${s.backend}: recorded student confidence`, typeof s.confidence === 'number')
-    } else {
-      check(`${s.backend}: failure recorded as a receipt, not a throw`, Boolean(s.error), String(s.error))
-    }
+const keys = new Set(recs.filter((r) => r.type === 'decision_receipt').map((r) => r.decision_id))
+check('every lane joined on one decision_id', keys.size === 1, `decision_ids=${[...keys].join(',')}`)
+const ids = recs.filter((r) => r.type === 'decision_receipt')
+check('trace_id and turn_key equal decision_id', ids.every((r) => r.trace_id === r.decision_id && r.turn_key === r.decision_id))
+check('no lane claims to have changed execution', ids.every((r) => r.student_changed_execution === false))
+
+for (const l of lanes) {
+  console.log(
+    `\n${l.backend} [${l.authority}] transport=${l.transport} model=${l.model} ok=${l.success} ms=${l.latency_ms} err=${String(l.error ?? '').slice(0, 110)}` +
+      (l.success ? `\n  difficulty=${l.difficulty} conf=${l.difficulty_confidence} probs=${JSON.stringify(l.difficulty_probs)}` +
+        `\n  specialty=${l.specialty} conf=${l.specialty_confidence} probs=${JSON.stringify(l.specialty_probs)}` +
+        `\n  costly_mistake=${l.costly_mistake} conf=${l.costly_mistake_confidence}` : ''),
+  )
+}
+for (const c of cmps) {
+  console.log(`\nCOMPARE ${c.reference} vs ${c.shadow} comparable=${c.comparable}`)
+  for (const [q, v] of Object.entries(c.questions ?? {})) {
+    console.log(`  ${q}: agree=${v.categorical_agreement} dConf=${v.confidence_delta} dDist=${v.distribution_delta} refSide=${v.reference_threshold_side} shadowSide=${v.shadow_threshold_side}`)
   }
+}
+
+// The blocked Vercel lane must fail loudly with its HTTP status, not silently.
+const vercel = lanes.find((l) => l.backend === 'vercel_jev')
+if (vercel) check('vercel_jev records its failure with an HTTP status', vercel.success === false ? Boolean(vercel.http_status) : true, `status=${vercel.http_status} err=${String(vercel.error ?? '').slice(0, 80)}`)
+
+const nano = lanes.find((l) => l.backend === 'nanojev')
+if (nano?.success) {
+  check('nanojev kept full difficulty distribution', nano.difficulty_probs !== null && typeof nano.difficulty_probs === 'object')
+  check('nanojev kept full specialty distribution', nano.specialty_probs !== null && typeof nano.specialty_probs === 'object')
+}
+const nanoCmp = cmps.find((c) => c.shadow === 'nanojev')
+if (nanoCmp?.comparable) {
+  const vals = Object.values(nanoCmp.questions ?? {})
+  check('comparison preserved continuous deltas, not just agreement', vals.every((v) => 'confidence_delta' in v && 'distribution_delta' in v))
+  check('comparison recorded which side of the 0.6 threshold each lane fell', vals.every((v) => 'reference_threshold_side' in v && 'shadow_threshold_side' in v))
 }
 
 console.log(`\n${failures === 0 ? 'ALL PASS' : `${failures} FAILURE(S)`}`)
