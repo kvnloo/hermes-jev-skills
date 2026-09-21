@@ -10,7 +10,7 @@
 // No prompt text is written to receipts. No DSH core patch is required: this uses
 // the public `agent/request` waterfall and rewrites the proposed config.
 import { appendFileSync, mkdirSync, readFileSync } from 'node:fs'
-import { execFile } from 'node:child_process'
+import { execFile, spawn } from 'node:child_process'
 import { dirname } from 'node:path'
 
 export const name = 'hermes-jev-dsh'
@@ -28,6 +28,82 @@ const TIMEOUT_MS = Number(process.env.JEV_DSH_TIMEOUT_MS || 4000)
 // Harness-specific mapping: canonical tier -> DSH effort vocabulary. Never `max`.
 function effortForTier(tier) {
   return tier === 'hard' ? 'high' : 'low'
+}
+
+// ── Shadow decision backends (z0int) ─────────────────────────────────────────
+// Observers only. They can never change provider/model/effort/RLM/tools, and a
+// failure is recorded and ignored. nanojev is warm ~259 ms; decider_2b has a
+// ~190 s cold load, so it is opt-in via JEV_DSH_SHADOW_BACKENDS.
+const SHADOW_BACKENDS = (process.env.JEV_DSH_SHADOW_BACKENDS || 'nanojev').split(',').filter(Boolean)
+const SHADOW_PY = process.env.JEV_DSH_SHADOW_PYTHON || '/home/kvn/tmp/openjev/.venv/bin/python'
+const SHADOW_BRIDGE = process.env.JEV_DSH_SHADOW_BRIDGE || `${JEV_ROOT}/dsh/bridge/shadow_decide.py`
+const SHADOW_TIMEOUT_MS = Number(process.env.JEV_DSH_SHADOW_TIMEOUT_MS || 60000)
+
+/** Fire-and-forget student evaluation. MUST NOT block or affect the turn. */
+function runShadow({ prompt, turn, agentId, jev }) {
+  if (!SHADOW_BACKENDS.length || !prompt) return
+  const turnKey = `${agentId ?? 'agent'}:${turn}`
+  try {
+    const child = spawn(
+      SHADOW_PY,
+      [SHADOW_BRIDGE, 'evaluate', '--prompt', prompt.slice(0, 4000), '--turn-key', turnKey, '--backends', SHADOW_BACKENDS.join(',')],
+      {
+        cwd: JEV_ROOT,
+        env: { ...process.env, JEV_DSH_ROOT: JEV_ROOT, Z0INT_SRC: process.env.Z0INT_SRC || '/home/kvn/tmp/openjev/src' },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      },
+    )
+    let out = ''
+    child.stdout.on('data', (d) => { out += d })
+    child.stderr.on('data', () => {})
+    const killer = setTimeout(() => { try { child.kill('SIGKILL') } catch {} }, SHADOW_TIMEOUT_MS)
+    child.on('close', () => {
+      clearTimeout(killer)
+      try {
+        const parsed = JSON.parse(out)
+        for (const b of parsed.backends || []) {
+          const diff = b.answers?.difficulty ?? {}
+          const kind = b.answers?.kind ?? {}
+          const costly = b.answers?.costly_mistake ?? {}
+          emit({
+            type: 'shadow_comparison',
+            trace_id: agentId ?? null,
+            turn_key: turnKey,
+            decision_id: turnKey,
+            harness: 'dsh',
+            policy_version: 'route-2',
+            backend: b.backend,
+            model: b.model ?? null,
+            success: Boolean(b.success),
+            error: b.error ?? null,
+            difficulty: diff.value ?? null,
+            difficulty_probs: diff.probabilities ?? null,
+            specialty: kind.value ?? null,
+            specialty_probs: kind.probabilities ?? null,
+            costly_mistake_prob: costly.probabilities?.true ?? null,
+            confidence: diff.confidence ?? null,
+            latency_ms: b.total_latency_ms ?? null,
+            backend_latency_ms: b.backend_latency_ms ?? null,
+            jev_tier: jev?.tier ?? null,
+            jev_difficulty: jev?.difficulty ?? null,
+            jev_specialty: jev?.specialty ?? null,
+            jev_confidence: jev?.confidence ?? null,
+            jev_costly_mistake: jev?.costly_mistake ?? null,
+            specialty_agreement: kind.value != null && jev?.specialty != null ? kind.value === jev.specialty : null,
+            confidence_delta:
+              diff.confidence != null && jev?.confidence != null ? Number((diff.confidence - jev.confidence).toFixed(4)) : null,
+            threshold_distance_jev: jev?.confidence != null ? Number((jev.confidence - 0.6).toFixed(4)) : null,
+            threshold_distance_student: diff.confidence != null ? Number((diff.confidence - 0.6).toFixed(4)) : null,
+            student_changed_execution: false,
+          })
+        }
+      } catch (e) {
+        emit({ type: 'shadow_comparison', turn_key: turnKey, error: `parse:${String(e)}`, student_changed_execution: false })
+      }
+    })
+  } catch (e) {
+    emit({ type: 'shadow_comparison', turn_key: turnKey, error: String(e), student_changed_execution: false })
+  }
 }
 
 function emit(rec) {
@@ -327,6 +403,13 @@ export function apply(ctx) {
             fallback_reason: null,
             jev_latency_ms: d.latency_ms,
             adapter_latency_ms: Date.now() - started,
+          })
+          // Observers only: never awaited on the critical path.
+          runShadow({
+            prompt,
+            turn,
+            agentId: agent?.id ?? null,
+            jev: { tier: d.tier, difficulty: d.difficulty, specialty: d.specialty, confidence: d.confidence, costly_mistake: d.costly_mistake },
           })
         } else {
           emit({
