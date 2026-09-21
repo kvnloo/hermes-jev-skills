@@ -60,16 +60,21 @@ let recs = []
 while (Date.now() < deadline) {
   recs = read()
   const lanes = recs.filter((r) => r.type === 'decision_receipt')
-  if (lanes.some((l) => l.backend !== 'systemone_direct') && recs.some((r) => r.type === 'decision_comparison')) break
+  if (lanes.some((l) => l.backend !== 'jev_direct') && recs.some((r) => r.type === 'decision_comparison')) break
   await new Promise((r) => setTimeout(r, 500))
 }
 
 const lanes = recs.filter((r) => r.type === 'decision_receipt')
 const cmps = recs.filter((r) => r.type === 'decision_comparison')
 console.log(`\nreceipt types: ${JSON.stringify([...new Set(recs.map((r) => r.type))])}`)
-check('one production lane emitted', lanes.filter((l) => l.backend === 'systemone_direct').length === 1)
+check('one production lane emitted', lanes.filter((l) => l.backend === 'jev_direct').length === 1)
 check('exactly one lane claims production authority', lanes.filter((l) => l.authority === 'production').length === 1)
-check('shadow lanes are labelled shadow', lanes.filter((l) => l.backend !== 'systemone_direct').every((l) => l.authority === 'shadow'))
+check('shadow lanes are labelled shadow', lanes.filter((l) => l.backend !== 'jev_direct').every((l) => l.authority === 'shadow'))
+check('the reference lane declares family jev / transport typesafe_direct',
+  lanes.some((l) => l.backend === 'jev_direct' && l.backend_family === 'jev' && l.transport === 'typesafe_direct'))
+// The Vercel transport is a parity lane, not an independent vote, and must NOT
+// be called on ordinary turns while the account is blocked.
+check('jev_vercel is not called by default', lanes.every((l) => l.backend !== 'jev_vercel'))
 
 const keys = new Set(recs.filter((r) => r.type === 'decision_receipt').map((r) => r.decision_id))
 check('every lane joined on one decision_id', keys.size === 1, `decision_ids=${[...keys].join(',')}`)
@@ -93,8 +98,10 @@ for (const c of cmps) {
 }
 
 // The blocked Vercel lane must fail loudly with its HTTP status, not silently.
-const vercel = lanes.find((l) => l.backend === 'vercel_jev')
-if (vercel) check('vercel_jev records its failure with an HTTP status', vercel.success === false ? Boolean(vercel.http_status) : true, `status=${vercel.http_status} err=${String(vercel.error ?? '').slice(0, 80)}`)
+const parity = cmps.filter((c) => c.kind === 'parity')
+const independent = cmps.filter((c) => c.kind === 'independent')
+check('no comparison to the same family is counted as an independent vote', parity.every((c) => c.counts_as_independent_vote === false))
+check('the nanojev comparison is the independent one', independent.every((c) => c.shadow_family !== 'jev' && c.counts_as_independent_vote === true))
 
 const nano = lanes.find((l) => l.backend === 'nanojev')
 if (nano?.success) {

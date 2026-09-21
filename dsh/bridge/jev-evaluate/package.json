@@ -1,0 +1,11 @@
+{
+  "name": "jev-evaluate",
+  "private": true,
+  "type": "module",
+  "description": "Native AI SDK experimental_evaluate() bridge for the Jev backend family.",
+  "dependencies": {
+    "@ai-sdk/gateway": "^4.0.87",
+    "@ai-sdk/typesafe-ai": "^3.0.4",
+    "ai": "^7.0.107"
+  }
+}

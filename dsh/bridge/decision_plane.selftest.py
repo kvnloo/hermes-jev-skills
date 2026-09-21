@@ -61,20 +61,23 @@ def reference_lane(prompt: str) -> dict:
                            "probabilities": None if d.get("costly_mistake") is None else
                            {"true": d["costly_mistake"], "false": round(1 - d["costly_mistake"], 6)}},
     }
-    return {"backend": "systemone_direct", "transport": "canonical-jev-cli", "success": bool(d.get("routed")),
+    return {"backend": "jev_direct", "backend_family": "jev", "transport": "typesafe_direct",
+            "authority": "production", "success": bool(d.get("routed")),
             "model": d.get("model") or d.get("policy"), "revision": d.get("policy"), "tier": d.get("tier"),
             "reason": d.get("reason"), "latency_ms": round((time.monotonic() - t0) * 1000, 2), "answers": says}
 
 
 def main() -> int:
     import asyncio
-    lanes_wanted = [x for x in os.environ.get("JEV_DSH_SHADOW_BACKENDS", "vercel_jev,nanojev").split(",") if x]
-    lat = {"systemone_direct": [], "vercel_jev": [], "nanojev": []}
+    # Independent shadow backends only; jev_vercel is a transport of the
+    # reference family and is exercised through the parity test, not here.
+    lanes_wanted = [x for x in os.environ.get("JEV_DSH_SHADOW_BACKENDS", "nanojev").split(",") if x]
+    lat = {"jev_direct": [], "nanojev": []}
     rows = []
     for fid, band, prompt in FIXTURES:
         ref = reference_lane(prompt)
         out = asyncio.run(plane.fanout_async(prompt, f"fixture-{fid}", ref, lanes_wanted))
-        lat.setdefault("systemone_direct", []).append(ref.get("latency_ms"))
+        lat.setdefault("jev_direct", []).append(ref.get("latency_ms"))
         for lane in out["lanes"]:
             lat.setdefault(lane["backend"], []).append(lane.get("latency_ms"))
         rows.append((fid, band, out))
@@ -83,7 +86,8 @@ def main() -> int:
         print(f"\n=== FIXTURE {fid} ({band})")
         for lane in out["lanes"]:
             a = lane.get("answers") or {}
-            print(f"  {lane['backend']:18} role={'production' if lane['backend']=='systemone_direct' else 'shadow':10}"
+            print(f"  {lane['backend']:12} family={lane.get('backend_family'):9} transport={lane.get('transport'):18}"
+                  f" role={lane.get('authority','shadow'):10}"
                   f" ok={str(lane.get('success')):5} ms={lane.get('latency_ms')}")
             if a:
                 print(f"      difficulty={a.get('difficulty',{}).get('value')} conf={a.get('difficulty',{}).get('confidence')}")
@@ -95,8 +99,10 @@ def main() -> int:
                         print(f"      {k}_probs={json.dumps(pr)}")
             elif lane.get("error"):
                 print(f"      error={str(lane['error'])[:120]}")
+        print(f"  independent_vote_count={out['independent_vote_count']} parity_lanes={len(out['transport_parity'])}")
         for c in out["comparisons"]:
-            print(f"  -- {c['reference']} vs {c['shadow']} comparable={c['comparable']}")
+            print(f"  -- {c['reference']} vs {c['shadow']} kind={c['kind']}"
+                  f" independent_vote={c['counts_as_independent_vote']} comparable={c['comparable']}")
             for q, v in (c.get("questions") or {}).items():
                 print(f"     {q:14} agree={v['categorical_agreement']} dConf={v['confidence_delta']} "
                       f"dDist={v['distribution_delta']} refSide={v['reference_threshold_side']} shadowSide={v['shadow_threshold_side']}")

@@ -30,14 +30,26 @@ function effortForTier(tier) {
   return tier === 'hard' ? 'high' : 'low'
 }
 
-// ── Parallel decision plane (z0int lanes) ────────────────────────────────────
+// ── Parallel decision plane ──────────────────────────────────────────────────
 // One canonical packet per root real-user turn, fanned out concurrently.
-//   systemone_direct = production/reference authority (passed in, never re-bought)
-//   vercel_jev       = shadow
-//   nanojev          = shadow
-// Shadows can never change provider/model/effort/RLM/tools. A shadow failure is
-// recorded and ignored. No voting, no first-response-wins, no failover.
-const DECISION_BACKENDS = (process.env.JEV_DSH_SHADOW_BACKENDS || 'vercel_jev,nanojev').split(',').filter(Boolean)
+//
+// ONE backend family, TWO transports. `jev_direct` and `jev_vercel` answer the
+// same semantic questions over different carriers, so they are NOT independent
+// votes: their comparison is transport parity (latency, reliability,
+// availability, billing, distribution parity).
+//
+//   jev_direct  = family jev, transport typesafe_direct    -> production authority
+//   jev_vercel  = family jev, transport vercel_ai_gateway  -> parity lane, DISABLED
+//   nanojev     = family nanojev, transport in_process     -> independent shadow
+//
+// jev_vercel is off for ordinary turns: the Vercel account returns an
+// account-wide 403, so calling it per turn would cost latency for nothing. Its
+// health is cached by the bridge and never re-probed per turn.
+//
+// Independent shadow backends are nanojev, decider_2b (opt-in), and later
+// mushroom/fly. Shadows can never change provider/model/effort/RLM/tools. A
+// shadow failure is recorded and ignored. No voting, no first-response-wins.
+const DECISION_BACKENDS = (process.env.JEV_DSH_SHADOW_BACKENDS || 'nanojev').split(',').filter(Boolean)
 const LANE_PY = process.env.JEV_DSH_SHADOW_PYTHON || '/home/kvn/tmp/openjev/.venv/bin/python'
 const LANE_BRIDGE = process.env.JEV_DSH_SHADOW_BRIDGE || `${JEV_ROOT}/dsh/bridge/shadow_decide.py`
 const LANE_TIMEOUT_MS = Number(process.env.JEV_DSH_SHADOW_TIMEOUT_MS || 60000)
@@ -47,8 +59,10 @@ const LANE_TIMEOUT_MS = Number(process.env.JEV_DSH_SHADOW_TIMEOUT_MS || 60000)
 function referenceLane(d) {
   const q = (type, value, confidence, probabilities) => ({ type, value, confidence, probabilities })
   return {
-    backend: 'systemone_direct',
-    transport: 'canonical-jev-cli',
+    backend: 'jev_direct',
+    backend_family: 'jev',
+    transport: 'typesafe_direct',
+    authority: 'production',
     success: d.difficulty !== undefined,
     model: d.policy ?? 'route-2',
     revision: d.policy_version ?? null,
@@ -110,8 +124,11 @@ function runDecisionPlane({ prompt, turn, agentId, decision }) {
             ...common,
             type: 'decision_receipt',
             backend: lane.backend,
+            backend_family: lane.backend_family ?? null,
             transport: lane.transport ?? null,
-            authority: lane.backend === 'systemone_direct' ? 'production' : 'shadow',
+            authority: lane.authority ?? (lane.backend === 'jev_direct' ? 'production' : 'shadow'),
+            unavailable: Boolean(lane.unavailable),
+            skipped: Boolean(lane.skipped),
             model: lane.model ?? null,
             revision: lane.revision ?? null,
             success: Boolean(lane.success),
@@ -136,6 +153,14 @@ function runDecisionPlane({ prompt, turn, agentId, decision }) {
             type: 'decision_comparison',
             reference: cmp.reference,
             shadow: cmp.shadow,
+            reference_family: cmp.reference_family ?? null,
+            shadow_family: cmp.shadow_family ?? null,
+            reference_transport: cmp.reference_transport ?? null,
+            shadow_transport: cmp.shadow_transport ?? null,
+            // `parity` compares two transports of ONE family; only
+            // `independent` compares different models.
+            kind: cmp.kind ?? null,
+            counts_as_independent_vote: Boolean(cmp.counts_as_independent_vote),
             comparable: cmp.comparable,
             questions: cmp.questions ?? null,
           })

@@ -10,7 +10,7 @@ Usage:
   shadow_decide.py evaluate --prompt TEXT [--backends a,b] [--turn-key K]
 """
 from __future__ import annotations
-import argparse, json, os, sys, time
+import argparse, json, os, subprocess, sys, time
 
 JEV_ROOT = os.environ.get("JEV_DSH_ROOT", "/home/kvn/zer0/oss/hermes-jev-skills")
 Z0INT_SRC = os.environ.get("Z0INT_SRC", "/home/kvn/tmp/openjev/src")
@@ -119,9 +119,36 @@ def evaluate(prompt, ids, turn_key):
 # the fanout never re-purchases it. Vercel Jev and NanoJev are shadows: they are
 # recorded, never awaited on the turn's critical path, and never consulted.
 LANE_TIMEOUT_S = float(os.environ.get("JEV_DSH_LANE_TIMEOUT_S", "30"))
-VERCEL_URL = os.environ.get("JEV_DSH_VERCEL_URL", "https://ai-gateway.vercel.sh/v1/chat/completions")
-VERCEL_JEV_MODEL = os.environ.get("JEV_DSH_VERCEL_JEV_MODEL", "typesafe-ai/jev")
 MIN_CONFIDENCE = 0.6
+JEV_EVAL_DIR = os.environ.get("JEV_DSH_EVAL_DIR", os.path.join(JEV_ROOT, "dsh", "bridge", "jev-evaluate"))
+JEV_EVAL_HELPER = os.path.join(JEV_EVAL_DIR, "evaluate.mjs")
+
+# ONE backend family, TWO transports. `jev_direct` and `jev_vercel` are the same
+# family answering the same semantic questions over different transports, so
+# they are NOT two independent votes: their comparison is transport parity.
+# Independent shadow backends answer the same questions from a different model.
+FAMILY_OF = {
+    "jev_direct": "jev",
+    "jev_vercel": "jev",
+    "nanojev": "nanojev",
+    "decider_2b": "decider",
+}
+TRANSPORT_OF = {
+    "jev_direct": "typesafe_direct",
+    "jev_vercel": "vercel_ai_gateway",
+    "nanojev": "in_process",
+    "decider_2b": "in_process",
+}
+# Independent shadows only. jev_vercel is a transport of the reference family
+# and is NOT enabled for ordinary turns: the Vercel account returns an
+# account-wide 403, so calling it every turn would burn latency for nothing.
+DEFAULT_SHADOW_LANES = ["nanojev"]
+
+# Cached availability. Probed at most once per process, never per turn, and
+# overridable from a small state file so a restart does not re-probe either.
+VERCEL_STATE_FILE = os.environ.get("JEV_DSH_VERCEL_STATE", os.path.expanduser("~/.dsh/jev/vercel_transport.json"))
+VERCEL_ACCOUNT_403 = "account-wide 403: AI Gateway requires a valid credit card on file"
+_vercel_state_cache: dict | None = None
 
 
 def _credential(name: str) -> str:
@@ -159,51 +186,108 @@ def _lane_nanojev(req, _packet):
     try:
         res = registry.create_backend("nanojev").evaluate(req)
         return {
-            "backend": "nanojev", "transport": "in-process", "success": True,
+            "backend": "nanojev", "backend_family": "nanojev", "transport": "in_process", "success": True,
             "model": getattr(res, "model", None), "revision": getattr(res, "revision", None),
             "backend_latency_ms": getattr(res, "latency_ms", None),
             "latency_ms": round((time.monotonic() - t0) * 1000, 2),
             "answers": _answer_rows(res),
         }
     except Exception as exc:  # noqa: BLE001
-        return {"backend": "nanojev", "transport": "in-process", "success": False,
+        return {"backend": "nanojev", "backend_family": "nanojev", "transport": "in_process", "success": False,
                 "latency_ms": round((time.monotonic() - t0) * 1000, 2),
                 "error": f"{type(exc).__name__}: {exc}"}
 
 
-def _lane_vercel_jev(_req, packet):
-    """Typed structured-output evaluate against typesafe-ai/jev over Vercel Gateway."""
-    import urllib.error
-    import urllib.request
-
-    t0 = time.monotonic()
-    out = {"backend": "vercel_jev", "transport": "https", "model": VERCEL_JEV_MODEL}
-    key = _credential("AI_GATEWAY_API_KEY")
-    if not key:
-        out.update({"success": False, "error": "no AI_GATEWAY_API_KEY"})
-        return out
-    body = {
-        "model": VERCEL_JEV_MODEL,
-        "messages": [{"role": "user", "content": json.dumps(packet, ensure_ascii=False)}],
-        "response_format": {"type": "json_object"},
-        "temperature": 0,
-    }
-    req = urllib.request.Request(
-        VERCEL_URL, data=json.dumps(body).encode(),
-        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json",
-                 "User-Agent": "dsh-hermes-jev/0.1"},
-    )
+def jev_vercel_state() -> dict:
+    """Cached transport health. Never probes per turn."""
+    global _vercel_state_cache
+    if _vercel_state_cache is not None:
+        return _vercel_state_cache
+    state = {"transport": "vercel_ai_gateway", "family": "jev", "state": "unknown", "reason": None}
     try:
-        with urllib.request.urlopen(req, timeout=LANE_TIMEOUT_S) as resp:
-            payload = json.loads(resp.read().decode())
-        out.update({"success": True, "raw_usage": payload.get("usage"),
-                    "answers": json.loads(payload["choices"][0]["message"]["content"])})
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode(errors="replace")[:300]
-        out.update({"success": False, "http_status": exc.code, "error": detail})
+        with open(VERCEL_STATE_FILE, encoding="utf-8") as fh:
+            disk = json.load(fh)
+        state.update({k: disk[k] for k in ("state", "reason", "checked_at") if k in disk})
+    except (OSError, ValueError):
+        # No record yet: probe ONCE, not per turn.
+        state["checked_at"] = int(time.time())
+        if os.environ.get("JEV_DSH_VERCEL_PROBE", "") == "1":
+            used = _credential("AI_GATEWAY_API_KEY")
+            if not used:
+                state.update({"state": "unavailable", "reason": "no AI_GATEWAY_API_KEY reference"})
+            else:
+                r = _call_jev_transport("vercel_ai_gateway", {"state": {"probe": True},
+                                                              "questions": {"q": {"type": "boolean", "instructions": "probe"}}}, used)
+                if r.get("ok"):
+                    state.update({"state": "available", "reason": None})
+                elif r.get("http_status") == 403:
+                    state.update({"state": "unavailable", "reason": VERCEL_ACCOUNT_403})
+                else:
+                    state.update({"state": "unavailable", "reason": r.get("error")})
+        else:
+            state.update({"state": "unavailable", "reason": VERCEL_ACCOUNT_403})
+        try:
+            os.makedirs(os.path.dirname(VERCEL_STATE_FILE), exist_ok=True)
+            with open(VERCEL_STATE_FILE, "w", encoding="utf-8") as fh:
+                json.dump(state, fh)
+        except OSError:
+            pass
+    _vercel_state_cache = state
+    return state
+
+
+def _call_jev_transport(transport: str, payload: dict, api_key: str) -> dict:
+    """Native typed evaluation through the AI SDK helper. No chat, no JSON prompt.
+
+    Both transports share the canonical DecisionRequest {state, questions} and
+    differ only in the SDK provider that carries it.
+    """
+    req = {"transport": transport, "apiKey": api_key, "state": payload.get("state"),
+           "questions": payload.get("questions"), "timeoutMs": int(LANE_TIMEOUT_S * 1000)}
+    try:
+        proc = subprocess.run(["node", JEV_EVAL_HELPER], input=json.dumps(req), capture_output=True,
+                              text=True, timeout=LANE_TIMEOUT_S + 5, cwd=JEV_EVAL_DIR)
     except Exception as exc:  # noqa: BLE001
-        out.update({"success": False, "error": f"{type(exc).__name__}: {exc}"})
-    out["latency_ms"] = round((time.monotonic() - t0) * 1000, 2)
+        return {"ok": False, "family": "jev", "transport": transport, "error": f"{type(exc).__name__}: {exc}"}
+    if proc.returncode != 0:
+        return {"ok": False, "family": "jev", "transport": transport,
+                "error": f"helper exit {proc.returncode}: {proc.stderr.strip()[:200]}"}
+    try:
+        return json.loads(proc.stdout)
+    except ValueError:
+        return {"ok": False, "family": "jev", "transport": transport, "error": "helper produced no JSON"}
+
+
+def _lane_jev_transport(transport: str, packet: dict):
+    """A Jev transport lane. Same family, same frozen packet, different carrier."""
+    t0 = time.monotonic()
+    out = {"backend": "jev_vercel" if transport == "vercel_ai_gateway" else "jev_direct",
+           "backend_family": "jev", "transport": transport}
+    if transport == "vercel_ai_gateway":
+        state = jev_vercel_state()
+        if state.get("state") != "available":
+            out.update({"success": False, "skipped": True, "unavailable": True,
+                        "error": state.get("reason") or "transport unavailable"})
+            out["latency_ms"] = None
+            return out
+    key = _credential("AI_GATEWAY_API_KEY" if transport == "vercel_ai_gateway" else "TYPESAFE_AI_API_KEY")
+    if not key:
+        out.update({"success": False, "error": f"no credential for transport {transport}"})
+        out["latency_ms"] = round((time.monotonic() - t0) * 1000, 2)
+        return out
+    r = _call_jev_transport(transport, packet, key)
+    out.update({
+        "success": bool(r.get("ok")),
+        "model": r.get("model"),
+        "error": r.get("error"),
+        "http_status": r.get("http_status"),
+        "usage": r.get("usage"),
+        "rounding": r.get("rounding"),
+        "confidence_by_question": r.get("confidence"),
+        "latency_ms": round((time.monotonic() - t0) * 1000, 2),
+    })
+    if r.get("ok"):
+        out["answers"] = r.get("answers")
     return out
 
 
@@ -221,7 +305,17 @@ def _dist_delta(ref_ans, shad_ans):
 
 
 def compare(reference, shadow):
-    """Continuous-first comparison. Agreement is recorded, never used as authority."""
+    """Continuous-first comparison. Agreement is recorded, never used as authority.
+
+    `kind` distinguishes the two things a comparison can mean:
+      parity      - same backend family, two transports. Tests transport
+                    equivalence, NOT independent agreement.
+      independent - a different model answering the same questions. This is the
+                    only kind that carries any notion of corroboration.
+    """
+    ref_family = reference.get("backend_family") or FAMILY_OF.get(reference.get("backend", ""), "unknown")
+    shad_family = shadow.get("backend_family") or FAMILY_OF.get(shadow.get("backend", ""), "unknown")
+    kind = "parity" if ref_family == shad_family and ref_family != "unknown" else "independent"
     ra = reference.get("answers") or {}
     sa = shadow.get("answers") or {}
     per_q = {}
@@ -247,6 +341,12 @@ def compare(reference, shadow):
     return {
         "reference": reference.get("backend"),
         "shadow": shadow.get("backend"),
+        "reference_family": ref_family,
+        "shadow_family": shad_family,
+        "reference_transport": reference.get("transport"),
+        "shadow_transport": shadow.get("transport"),
+        "kind": kind,
+        "counts_as_independent_vote": kind == "independent",
         "comparable": bool(ra) and bool(sa),
         "questions": per_q,
     }
@@ -280,8 +380,10 @@ async def fanout_async(prompt: str, turn_key: str, systemone, ids) -> dict:
 
     jobs, names = [], []
     for i in ids:
-        if i == "vercel_jev":
-            jobs.append(guarded(_lane_vercel_jev, req, packet)); names.append(i)
+        if i == "jev_vercel":
+            jobs.append(guarded(_lane_jev_transport, "vercel_ai_gateway", packet)); names.append(i)
+        elif i == "jev_direct":
+            jobs.append(guarded(_lane_jev_transport, "typesafe_direct", packet)); names.append(i)
         elif i == "nanojev":
             jobs.append(guarded(_lane_nanojev, req, packet)); names.append(i)
         elif i in KNOWN_UNREADY:
@@ -290,8 +392,10 @@ async def fanout_async(prompt: str, turn_key: str, systemone, ids) -> dict:
     settled = await asyncio.gather(*jobs, return_exceptions=True) if jobs else []
 
     reference = dict(systemone or {})
-    reference.setdefault("backend", "systemone_direct")
-    reference.setdefault("transport", "canonical-jev-cli")
+    reference.setdefault("backend", "jev_direct")
+    reference.setdefault("backend_family", "jev")
+    reference.setdefault("transport", "typesafe_direct")
+    reference.setdefault("authority", "production")
     reference.setdefault("success", bool(reference.get("answers")))
 
     shadows = []
@@ -300,7 +404,14 @@ async def fanout_async(prompt: str, turn_key: str, systemone, ids) -> dict:
             res = {"backend": name, "success": False, "error": f"{type(res).__name__}: {res}"}
         elif res.get("backend") == "unknown":
             res["backend"] = name
+        res.setdefault("authority", "shadow")
+        res.setdefault("backend_family", FAMILY_OF.get(res.get("backend", ""), "unknown"))
+        res.setdefault("transport", TRANSPORT_OF.get(res.get("backend", ""), "unknown"))
         shadows.append(res)
+
+    comparisons = [compare(reference, s) for s in shadows]
+    parity = [c for c in comparisons if c["kind"] == "parity"]
+    independent = [c for c in comparisons if c["kind"] == "independent"]
 
     return {
         "turn_key": turn_key, "decision_id": turn_key, "trace_id": turn_key,
@@ -308,8 +419,11 @@ async def fanout_async(prompt: str, turn_key: str, systemone, ids) -> dict:
         "packet_chars": len(json.dumps(packet, ensure_ascii=False)),
         "packet": packet,
         "lanes": [reference] + shadows,
-        "comparisons": [compare(reference, s) for s in shadows],
-        "raw": {"lanes": [reference] + shadows, "comparisons": [compare(reference, s) for s in shadows]},
+        "comparisons": comparisons,
+        "transport_parity": parity,
+        "independent_comparisons": independent,
+        "independent_vote_count": len([c for c in independent if c["comparable"]]),
+        "raw": {"lanes": [reference] + shadows, "comparisons": comparisons},
     }
 
 
@@ -318,7 +432,7 @@ def main():
     ap.add_argument("op", choices=["health", "evaluate", "fanout"])
     ap.add_argument("--prompt", default="")
     ap.add_argument("--turn-key", default="")
-    ap.add_argument("--backends", default=",".join(DEFAULT_BACKENDS))
+    ap.add_argument("--backends", default=",".join(DEFAULT_SHADOW_LANES))
     ap.add_argument("--backend", default=None)
     ap.add_argument("--systemone-json", default="")
     ap.add_argument("--no-packet", action="store_true")
