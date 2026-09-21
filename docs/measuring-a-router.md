@@ -38,6 +38,34 @@ those turns actually ran on.
 Only Jev is called. No routed model is invoked, so replaying a few hundred turns costs
 cents.
 
+## Join routing decisions to independent quality outcomes
+
+Cost replay answers "what would this routing policy have cost?" It does **not** answer
+"would those models have completed the work correctly?"
+
+Before a policy changes live routing, evaluate quality on an outcome the router did not
+create. Depending on the workload that might be tests/CI, an external verifier, user
+correction, or another explicit task-success signal.
+
+Do not use Jev's own class/tier decision as the gold label for Jev or for a distilled
+student. Teacher agreement is useful weak supervision, not verification.
+
+Where you have enough traffic, compare on frozen groups:
+
+```text
+baseline features/counters only
+Jev semantic decision only
+features/counters + Jev decision
+```
+
+Keep all turns from one session/work-item lineage in the same fold. If retries and
+continuations from one task appear on both sides of the split, the reported generalization
+will be too optimistic.
+
+Record the probability/confidence distribution as well as the selected tier. For every
+threshold that matters, inspect calibration/reliability, false-confidence cases and the
+quality/cost trade-off on the actual target traffic.
+
 ## A/B-ing a policy
 
 `jevkit.replay.compare` runs the same turns under several configs. Cache `client.ask` by

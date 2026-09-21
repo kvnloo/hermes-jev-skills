@@ -24,12 +24,7 @@ Both have happened; both now have tests that catch them. If you have Docker or A
 container run --rm -v "$PWD":/w -w /w python:3.13-slim python -m unittest discover -s tests
 ```
 
-**Jev's confidence is calibrated, and everything here reads it as such.** The 0.65 floor
-before a GUI action, the 0.7 floor before a transcript turn is dropped, "unsure is not
-hard" in the router — all of them assume a real probability. Substituting a language model
-that reports its own confidence silently changes every one of those thresholds without
-failing anywhere visible. If a feature needs a model that is not Jev, it belongs behind a
-different name and its own threshold.
+**Jev exposes probability/confidence values, and the thresholds here assume that probability contract.** The 0.65 floor before a GUI action, the 0.7 floor before a transcript turn is dropped, and "unsure is not hard" in the router all depend on that semantics. But calibration is still **question-family and deployment-distribution dependent**: before a threshold is used as evidence for promotion, replay it against independent outcomes from the target workload and measure reliability / false-confidence cases. A threshold may remain a conservative fail-open rail before that; it is not by itself proof that the decision is correct. Substituting a language model that reports its own confidence silently changes every one of those thresholds without failing anywhere visible. If a feature needs a model that is not Jev, it belongs behind a different name and its own measured threshold.
 
 ## The sync rule
 

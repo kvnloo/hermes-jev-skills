@@ -45,7 +45,7 @@ Python 3.9 or newer, no dependencies. Got it as a zip? Unzip it anywhere and run
 
 The installer finds Hermes, Claude Code and Codex on the machine and installs for each one it finds. `python3 install.py --check` shows exactly what it would do without changing anything. `--uninstall` reverses it.
 
-**Not sure yet?** Run `jev models suggest --write` to draft routing pools from price bands, then `/jev routing shadow` for a day. Shadow mode decides and logs without switching anything, so a day of decisions costs almost nothing and risks nothing. Turn it on when the log looks right.
+**Not sure yet?** Run `jev models suggest --write` to draft routing pools from price bands, then `/jev routing shadow` for a day. Shadow mode decides and logs without switching anything, so it is the right way to collect evidence safely. **Do not turn a feature on merely because the shadow log looks plausible.** Replay or join those decisions to an independent outcome for that feature (verified task quality, downstream recall, human correction, environment success, and actual cost/latency), then promote only if the held-out result clears the feature's gate.
 
 ## On Hermes
 
