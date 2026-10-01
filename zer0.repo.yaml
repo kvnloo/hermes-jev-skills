@@ -1,0 +1,52 @@
+version: 1
+repo: kvnloo/hermes-jev-skills
+id: hermes-jev-skills
+kind: suite
+summary: Portable Jev typed-decision skills plus Hermes integration for bounded routing, retrieval filtering, turn selection, triage, and computer/browser action choice.
+
+architecture:
+  subsystems:
+    - id: jevkit
+      name: Jev decision client and CLI
+      kind: decision
+      summary: Implements typed Jev request/response handling, redaction, confidence/failure behavior, and local decision helpers.
+      paths: [jevkit/, bin/]
+    - id: portable-skills
+      name: Portable decision skills
+      kind: decision
+      summary: Packages model routing, memory filtering, search, skill selection, triage, mailbox, and action-choice workflows as reusable skill files.
+      paths: [skills/]
+      depends_on: [jevkit]
+    - id: hermes-plugin
+      name: Hermes Jev plugin
+      kind: integration
+      summary: Connects typed decisions to Hermes public plugin seams for routing, skill suggestions, screening, and tools without patching Hermes core.
+      paths: [hermes/plugin/, hermes/]
+      depends_on: [jevkit, portable-skills]
+    - id: routing-dashboard
+      name: Routing dashboard
+      kind: presentation
+      summary: Visualizes routing pools, modes, decisions, confidence, latency, and live decision state.
+      paths: [router-dashboard/]
+      depends_on: [jevkit]
+    - id: evaluation-corpus
+      name: Jev evaluation corpus
+      kind: evidence
+      summary: Stores measured scorecards and held-out evidence for decision tasks separately from runtime choice.
+      paths: [evals/, tests/]
+      depends_on: [jevkit]
+
+  implements_mechanisms: [jev-typed-decision]
+  provides_interfaces: []
+  consumes_interfaces: []
+  produces_representations: []
+  consumes_representations: []
+
+  boundaries:
+    owns: [portable Jev decision skills, Hermes Jev plugin integration, local redaction and fail-open guards, Jev decision evaluation artifacts]
+    not_here: [frontier prose generation, canonical z0intelligence decision policy, provider execution, Zer0 architecture authority]
+
+  evidence:
+    docs: [README.md, docs/]
+    tests: [tests/, evals/]
+    schemas: []
