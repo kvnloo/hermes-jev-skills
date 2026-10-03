@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Docs: outcome-grounded promotion.** `CONTRIBUTING.md`, the README and the router/feature guides now say what a shadow log can and cannot show: it is instrumentation, not validation. Turning a feature on needs its decisions joined to an outcome Jev did not create (tests/CI, a verifier, human correction, measured cost/latency), compared on grouped held-out folds; teacher agreement is weak supervision, and calibration claims are scoped to the measured workload. No code, thresholds or defaults change.
+
 ## 0.22.1 (2026-10-02)
 
 Released by the daily Jev steward: 5 commit(s) on main since v0.22.0.
