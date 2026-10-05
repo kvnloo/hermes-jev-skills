@@ -1,5 +1,6 @@
 import { execSync } from "node:child_process";
-import { existsSync, join } from "node:fs";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 
 const DEPS_ROOT = process.env.JEV_DEPS_ROOT || "/home/kvn/zer0/.deps/hermes-jev-skills";
@@ -8,10 +9,24 @@ function adapterPath(): string {
 	return join(DEPS_ROOT, "packages", "jev", "src", "adapter.py");
 }
 
+interface RouteModel {
+	provider?: string;
+	id?: string;
+}
+
+interface RouteCtx {
+	models: {
+		current(): RouteModel | undefined;
+		resolve(spec: string): RouteModel | undefined;
+	};
+	setModel(model: RouteModel): Promise<boolean>;
+	cwd?: string;
+}
+
 export default function hermesJevOMP(pi: ExtensionAPI): void {
 	pi.setLabel("Hermes-JeV model routing (shared stack via adapter)");
 
-	pi.on("before_agent_start", async (event: unknown, ctx: { models: { current(): { provider?: string; id?: string } | undefined; resolve(spec: string): { provider?: string; id?: string } | undefined }; setModel(model: { provider?: string; id?: string }): Promise<boolean>; cwd?: string }, log?: (msg: string) => void }) => {
+	pi.on("before_agent_start", async (event: unknown, ctx: RouteCtx) => {
 		try {
 			const prompt = (typeof event === "object" && event !== null && "prompt" in event)
 				? String((event as Record<string, unknown>).prompt ?? "").trim()
